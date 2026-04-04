@@ -27,13 +27,14 @@ const ROOM_ID_PATTERN = /^[a-zA-Z0-9_-]{3,120}$/;
 const DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL || "nova-2";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const AI_TRANSCRIPT_MIN_WORDS = Number(process.env.AI_TRANSCRIPT_MIN_WORDS || 1);
-const AI_ANALYSIS_MIN_WORDS = Number(process.env.AI_ANALYSIS_MIN_WORDS || 6);
+const AI_ANALYSIS_MIN_WORDS = Number(process.env.AI_ANALYSIS_MIN_WORDS || 4);
 const AI_MAX_SEGMENTS = Number(process.env.AI_MAX_SEGMENTS || 6);
 const AI_MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 8);
+const AI_DISPLAY_TRANSCRIPT_HISTORY = Number(process.env.AI_DISPLAY_TRANSCRIPT_HISTORY || 80);
 const AI_ANALYSIS_DEBOUNCE_MS = Number(process.env.AI_ANALYSIS_DEBOUNCE_MS || 2000);
-const AI_PARAGRAPH_MIN_WORDS = Number(process.env.AI_PARAGRAPH_MIN_WORDS || 24);
-const AI_PARAGRAPH_SOFT_MIN_WORDS = Number(process.env.AI_PARAGRAPH_SOFT_MIN_WORDS || 12);
-const AI_PARAGRAPH_FLUSH_MS = Number(process.env.AI_PARAGRAPH_FLUSH_MS || 4000);
+const AI_PARAGRAPH_MIN_WORDS = Number(process.env.AI_PARAGRAPH_MIN_WORDS || 16);
+const AI_PARAGRAPH_SOFT_MIN_WORDS = Number(process.env.AI_PARAGRAPH_SOFT_MIN_WORDS || 8);
+const AI_PARAGRAPH_FLUSH_MS = Number(process.env.AI_PARAGRAPH_FLUSH_MS || 2500);
 const authRateLimiter = new Map();
 const aiInterviewState = new Map();
 const eyeAnalysisState = new Map();
@@ -173,7 +174,7 @@ function pushTranscriptHistory(state, text) {
     text: normalizedTranscript,
     createdAt: Date.now(),
   });
-  if (state.transcriptHistory.length > AI_MAX_HISTORY) {
+  if (state.transcriptHistory.length > AI_DISPLAY_TRANSCRIPT_HISTORY) {
     state.transcriptHistory.shift();
   }
 
@@ -1025,7 +1026,7 @@ function emitAiTranscriptUpdate(roomId) {
   const state = aiInterviewState.get(roomId);
   if (!room || !state) return;
 
-  const transcripts = state.transcriptHistory.slice(-4);
+  const transcripts = state.transcriptHistory.slice(-AI_DISPLAY_TRANSCRIPT_HISTORY);
   room.participants.forEach((participant) => {
     if (participant.role === "interviewer") {
       io.to(participant.socketId).emit("ai-transcript-update", {
@@ -1520,7 +1521,7 @@ io.on("connection", (socket) => {
     if (normalizedRole === "interviewer") {
       socket.emit("ai-score-update", getAiSnapshot(roomId));
       socket.emit("ai-transcript-update", {
-        transcripts: getOrCreateAiState(roomId).transcriptHistory.slice(-4),
+        transcripts: getOrCreateAiState(roomId).transcriptHistory.slice(-AI_DISPLAY_TRANSCRIPT_HISTORY),
         draft: getOrCreateAiState(roomId).liveDraft,
         mode: getOrCreateAiState(roomId).transcriptMode,
       });
