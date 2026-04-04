@@ -22,7 +22,15 @@ const AUTH_WINDOW_MS = Number(process.env.AUTH_RATE_LIMIT_WINDOW_MS || 15 * 60 *
 const AUTH_MAX_REQUESTS = Number(process.env.AUTH_RATE_LIMIT_MAX_REQUESTS || 20);
 const TWILIO_NTS_TTL = Number(process.env.TWILIO_NTS_TTL || 3600);
 const ROOM_ID_PATTERN = /^[a-zA-Z0-9_-]{3,120}$/;
+const DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL || "nova-2";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash-lite";
+const AI_TRANSCRIPT_MIN_WORDS = Number(process.env.AI_TRANSCRIPT_MIN_WORDS || 12);
+const AI_ANALYSIS_MIN_WORDS = Number(process.env.AI_ANALYSIS_MIN_WORDS || 30);
+const AI_MAX_SEGMENTS = Number(process.env.AI_MAX_SEGMENTS || 6);
+const AI_MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 8);
+const AI_ANALYSIS_DEBOUNCE_MS = Number(process.env.AI_ANALYSIS_DEBOUNCE_MS || 7000);
 const authRateLimiter = new Map();
+const aiInterviewState = new Map();
 
 function failFast(message) {
   throw new Error(message);
@@ -127,6 +135,67 @@ function authLimiter(req, res, next) {
 
 function normalizeRole(role) {
   return role === "candidate" || role === "interviewer" ? role : null;
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function countWords(input) {
+  return String(input || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+}
+
+function compactWhitespace(input) {
+  return String(input || "").replace(/\s+/g, " ").trim();
+}
+
+function buildEmptyAiSnapshot() {
+  return {
+    aiLikelihood: null,
+    confidence: "idle",
+    samplesAnalyzed: 0,
+    updatedAt: null,
+  };
+}
+
+function getOrCreateAiState(roomId) {
+  if (!aiInterviewState.has(roomId)) {
+    aiInterviewState.set(roomId, {
+      roomId,
+      transcriptSegments: [],
+      scoreHistory: [],
+      rollingAiLikelihood: null,
+      confidence: "idle",
+      updatedAt: null,
+      analysisTimer: null,
+      analysisPromise: Promise.resolve(),
+    });
+  }
+
+  return aiInterviewState.get(roomId);
+}
+
+function clearAiState(roomId) {
+  const state = aiInterviewState.get(roomId);
+  if (state?.analysisTimer) {
+    clearTimeout(state.analysisTimer);
+  }
+  aiInterviewState.delete(roomId);
+}
+
+function getAiSnapshot(roomId) {
+  const state = aiInterviewState.get(roomId);
+  if (!state) return buildEmptyAiSnapshot();
+
+  return {
+    aiLikelihood: state.rollingAiLikelihood,
+    confidence: state.confidence,
+    samplesAnalyzed: state.scoreHistory.length,
+    updatedAt: state.updatedAt,
+  };
 }
 
 function hasSpacetimeConfig() {
@@ -336,6 +405,108 @@ function createSpacetimeClient() {
   };
 }
 
+function createAiReviewService() {
+  const deepgramApiKey = process.env.DEEPGRAM_API_KEY || "";
+  const geminiApiKey = process.env.GEMINI_API_KEY || "";
+
+  return {
+    isTranscriptionEnabled() {
+      return Boolean(deepgramApiKey);
+    },
+    isScoringEnabled() {
+      return Boolean(geminiApiKey);
+    },
+    async transcribeChunk(audioBuffer, mimeType) {
+      if (!deepgramApiKey || !audioBuffer?.length) {
+        return "";
+      }
+
+      const response = await fetch(
+        `https://api.deepgram.com/v1/listen?model=${encodeURIComponent(
+          DEEPGRAM_MODEL,
+        )}&smart_format=true&punctuate=true`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Token ${deepgramApiKey}`,
+            "Content-Type": mimeType || "audio/webm",
+          },
+          body: audioBuffer,
+        },
+      );
+
+      if (!response.ok) {
+        throw new Error(`Deepgram request failed with ${response.status}`);
+      }
+
+      const payload = await response.json();
+      return compactWhitespace(
+        payload?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "",
+      );
+    },
+    async scoreTranscript(recentTranscript, rollingContext) {
+      const transcript = compactWhitespace(recentTranscript);
+      if (!geminiApiKey || !transcript) {
+        return {
+          aiLikelihood: 0,
+          confidence: "idle",
+        };
+      }
+
+      const prompt = [
+        "Return JSON only.",
+        'Schema: {"aiLikelihood":number,"confidence":"low"|"medium"|"high"}',
+        "Task: estimate how likely this spoken interview answer sounds AI-generated.",
+        "Score natural hesitations, specificity, imperfection, and spoken cadence as more human.",
+        "Do not explain. Use the transcript only.",
+        rollingContext ? `Recent prior context: ${rollingContext}` : "",
+        `Transcript: ${transcript}`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+          GEMINI_MODEL,
+        )}:generateContent?key=${encodeURIComponent(geminiApiKey)}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              temperature: 0.1,
+              topP: 0.8,
+              maxOutputTokens: 40,
+              responseMimeType: "application/json",
+            },
+          }),
+        },
+      );
+
+      if (!response.ok) {
+        throw new Error(`Gemini request failed with ${response.status}`);
+      }
+
+      const payload = await response.json();
+      const text = payload?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+      const parsed = JSON.parse(text);
+
+      return {
+        aiLikelihood: clamp(Number(parsed?.aiLikelihood) || 0, 0, 100),
+        confidence:
+          parsed?.confidence === "low" ||
+          parsed?.confidence === "medium" ||
+          parsed?.confidence === "high"
+            ? parsed.confidence
+            : "medium",
+      };
+    },
+  };
+}
+
 function createRoomState(roomId) {
   return {
     roomId,
@@ -490,12 +661,89 @@ const port = process.env.PORT || 4000;
 const rooms = new Map();
 const spacetime = createSpacetimeClient();
 const twilioIce = createTwilioIceService();
+const aiReview = createAiReviewService();
 
 function getRoom(roomId) {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, createRoomState(roomId));
   }
   return rooms.get(roomId);
+}
+
+function emitAiScoreUpdate(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+
+  const snapshot = getAiSnapshot(roomId);
+  room.participants.forEach((participant) => {
+    if (participant.role === "interviewer") {
+      io.to(participant.socketId).emit("ai-score-update", snapshot);
+    }
+  });
+}
+
+function scheduleAiAnalysis(roomId) {
+  const state = getOrCreateAiState(roomId);
+  if (state.analysisTimer) {
+    clearTimeout(state.analysisTimer);
+  }
+
+  state.analysisTimer = setTimeout(() => {
+    state.analysisTimer = null;
+    runAiAnalysis(roomId);
+  }, AI_ANALYSIS_DEBOUNCE_MS);
+}
+
+function runAiAnalysis(roomId) {
+  const state = getOrCreateAiState(roomId);
+  state.analysisPromise = state.analysisPromise
+    .then(async () => {
+      const transcriptWindow = state.transcriptSegments.slice(-3).join(" ").trim();
+      if (countWords(transcriptWindow) < AI_ANALYSIS_MIN_WORDS) {
+        return;
+      }
+
+      const priorContext = state.transcriptSegments.slice(-5, -3).join(" ").trim();
+      try {
+        const result = await aiReview.scoreTranscript(transcriptWindow, priorContext);
+        state.scoreHistory.push({
+          aiLikelihood: result.aiLikelihood,
+          confidence: result.confidence,
+          createdAt: Date.now(),
+        });
+        if (state.scoreHistory.length > AI_MAX_HISTORY) {
+          state.scoreHistory.shift();
+        }
+
+        const average =
+          state.scoreHistory.reduce((sum, item) => sum + item.aiLikelihood, 0) /
+          state.scoreHistory.length;
+        state.rollingAiLikelihood = Math.round(average);
+        state.confidence = result.confidence;
+        state.updatedAt = Date.now();
+        emitAiScoreUpdate(roomId);
+      } catch (error) {
+        console.error("[ai-review] scoring failed", error.message);
+      }
+    })
+    .catch((error) => {
+      console.error("[ai-review] analysis queue failed", error.message);
+    });
+}
+
+function queueTranscriptForAnalysis(roomId, transcript) {
+  const normalizedTranscript = compactWhitespace(transcript);
+  if (!normalizedTranscript || countWords(normalizedTranscript) < AI_TRANSCRIPT_MIN_WORDS) {
+    return;
+  }
+
+  const state = getOrCreateAiState(roomId);
+  state.transcriptSegments.push(normalizedTranscript);
+  if (state.transcriptSegments.length > AI_MAX_SEGMENTS) {
+    state.transcriptSegments.shift();
+  }
+
+  scheduleAiAnalysis(roomId);
 }
 
 function emitRoomState(roomId) {
@@ -510,11 +758,17 @@ function emitRoomState(roomId) {
 function removeParticipant(roomId, peerId) {
   const room = rooms.get(roomId);
   if (!room) return;
+  const removedParticipant = room.participants.get(peerId);
   room.participants.delete(peerId);
   spacetime.removeParticipant(roomId, peerId);
   if (room.participants.size === 0) {
+    clearAiState(roomId);
     rooms.delete(roomId);
     return;
+  }
+  if (removedParticipant?.role === "candidate") {
+    clearAiState(roomId);
+    emitAiScoreUpdate(roomId);
   }
   emitRoomState(roomId);
 }
@@ -557,6 +811,10 @@ app.get("/health", (_, res) => {
     rooms: rooms.size,
     origins: IS_PRODUCTION ? undefined : allowedOrigins,
     db: spacetime.getStatus(),
+    ai: {
+      transcription: aiReview.isTranscriptionEnabled(),
+      scoring: aiReview.isScoringEnabled(),
+    },
   });
 });
 
@@ -739,6 +997,9 @@ io.on("connection", (socket) => {
 
     socket.emit("room-users", { users: serializeUsers(room) });
     socket.emit("room-state", buildRoomState(room));
+    if (normalizedRole === "interviewer") {
+      socket.emit("ai-score-update", getAiSnapshot(roomId));
+    }
     socket.to(roomId).emit("peer-joined", serializeParticipant(participant));
 
     if (!validatedShare.accepted && validatedShare.message) {
@@ -861,6 +1122,52 @@ io.on("connection", (socket) => {
 
     emitRoomState(roomId);
   });
+
+  socket.on(
+    "candidate-audio-chunk",
+    async ({ roomId, peerId, mimeType, audioBase64 }, callback) => {
+      const room = rooms.get(roomId);
+      const participant = room?.participants.get(peerId);
+
+      if (!room || !participant) {
+        callback?.({ ok: false, message: "Participant not found in room." });
+        return;
+      }
+
+      if (participant.socketId !== socket.id || participant.role !== "candidate") {
+        callback?.({ ok: false, message: "Only the candidate can upload interview audio." });
+        return;
+      }
+
+      if (!buildRoomState(room).interviewStarted) {
+        callback?.({ ok: false, message: "Interview audio can be processed only after the interview starts." });
+        return;
+      }
+
+      if (!audioBase64 || !aiReview.isTranscriptionEnabled()) {
+        callback?.({ ok: true, skipped: true });
+        return;
+      }
+
+      try {
+        const audioBuffer = Buffer.from(audioBase64, "base64");
+        if (!audioBuffer.length) {
+          callback?.({ ok: true, skipped: true });
+          return;
+        }
+
+        const transcript = await aiReview.transcribeChunk(audioBuffer, mimeType);
+        if (transcript) {
+          queueTranscriptForAnalysis(roomId, transcript);
+        }
+
+        callback?.({ ok: true });
+      } catch (error) {
+        console.error("[ai-review] transcription failed", error.message);
+        callback?.({ ok: false, message: "Unable to process interview audio right now." });
+      }
+    },
+  );
 
   socket.on("leave-room", ({ roomId, peerId }) => {
     removeParticipant(roomId, peerId);
