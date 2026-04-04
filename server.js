@@ -31,6 +31,7 @@ const AI_MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 8);
 const AI_ANALYSIS_DEBOUNCE_MS = Number(process.env.AI_ANALYSIS_DEBOUNCE_MS || 2000);
 const authRateLimiter = new Map();
 const aiInterviewState = new Map();
+const eyeAnalysisState = new Map();
 
 function failFast(message) {
   throw new Error(message);
@@ -150,6 +151,50 @@ function countWords(input) {
 
 function compactWhitespace(input) {
   return String(input || "").replace(/\s+/g, " ").trim();
+}
+
+function getConfidence(score, eventCount) {
+  if (eventCount < 10) {
+    return "low";
+  }
+
+  const distanceFromThreshold = Math.abs(score - 60);
+  if (distanceFromThreshold >= 18 && eventCount >= 18) {
+    return "high";
+  }
+
+  return "medium";
+}
+
+function buildEmptyEyeSnapshot() {
+  return {
+    isCheating: false,
+    cheatingScore: 0,
+    isTypewriterMovement: false,
+    typewriterScore: 0,
+    confidence: "idle",
+    summary: "Waiting for candidate eye-movement data.",
+    reason: "No analysis window received yet.",
+    recommendation: "Keep monitoring the candidate feed.",
+    eventCount: 0,
+    lastUpdatedAt: null,
+    history: [],
+  };
+}
+
+function getOrCreateEyeState(roomId) {
+  if (!eyeAnalysisState.has(roomId)) {
+    eyeAnalysisState.set(roomId, {
+      latest: buildEmptyEyeSnapshot(),
+      history: [],
+    });
+  }
+
+  return eyeAnalysisState.get(roomId);
+}
+
+function clearEyeState(roomId) {
+  eyeAnalysisState.delete(roomId);
 }
 
 function buildEmptyAiSnapshot() {
@@ -541,6 +586,138 @@ function createAiReviewService() {
   };
 }
 
+function analyzeEyeEventsHeuristically(movementEvents, phase) {
+  const pattern = movementEvents.map((event) => event.direction).join("");
+  const total = movementEvents.length;
+
+  if (phase !== "ANSWER") {
+    return {
+      isCheating: false,
+      cheatingScore: 0,
+      isTypewriterMovement: false,
+      typewriterScore: 0,
+      confidence: "high",
+      summary: `Pattern ignored because phase is ${phase}.`,
+      reason: "Candidate is not actively answering a question.",
+      recommendation: "Wait for the candidate to continue answering.",
+      pattern,
+      eventCount: total,
+    };
+  }
+
+  if (total < 10) {
+    return {
+      isCheating: false,
+      cheatingScore: 0,
+      isTypewriterMovement: false,
+      typewriterScore: 0,
+      confidence: "low",
+      summary: "Not enough eye movement data.",
+      reason: `Only ${total} events were captured in this window.`,
+      recommendation: "Continue monitoring the candidate feed.",
+      pattern,
+      eventCount: total,
+    };
+  }
+
+  const rightCount = movementEvents.filter((event) => event.direction === "R").length;
+  const leftCount = total - rightCount;
+  let transitions = 0;
+  let rapidTransitions = 0;
+  let maxRStreak = 0;
+  let maxLStreak = 0;
+  let currentStreak = 1;
+  let currentDir = movementEvents[0].direction;
+
+  for (let index = 1; index < total; index += 1) {
+    const current = movementEvents[index];
+    const prev = movementEvents[index - 1];
+
+    if (current.direction === currentDir) {
+      currentStreak += 1;
+    } else {
+      if (currentDir === "R") maxRStreak = Math.max(maxRStreak, currentStreak);
+      if (currentDir === "L") maxLStreak = Math.max(maxLStreak, currentStreak);
+      currentDir = current.direction;
+      currentStreak = 1;
+    }
+
+    if (current.direction !== prev.direction) {
+      transitions += 1;
+
+      if (current.timestamp && prev.timestamp) {
+        const gapMs = new Date(current.timestamp).getTime() - new Date(prev.timestamp).getTime();
+        if (gapMs <= 2000) {
+          rapidTransitions += 1;
+        }
+      } else {
+        rapidTransitions += 1;
+      }
+    }
+  }
+
+  if (currentDir === "R") maxRStreak = Math.max(maxRStreak, currentStreak);
+  if (currentDir === "L") maxLStreak = Math.max(maxLStreak, currentStreak);
+
+  const alternationRate = rapidTransitions / Math.max(total - 1, 1);
+  const rightBias = rightCount / total;
+  const balanceRaw = 1 - Math.abs(rightBias - 0.5);
+  const balanceScore = clamp(balanceRaw * 1.5, 0, 1);
+
+  let sweepScore = 0;
+  if (alternationRate >= 0.03 && alternationRate <= 0.4) {
+    if (alternationRate >= 0.05 && alternationRate <= 0.25) {
+      sweepScore = 1;
+    } else if (alternationRate < 0.05) {
+      sweepScore = alternationRate / 0.05;
+    } else {
+      sweepScore = clamp(1 - ((alternationRate - 0.25) / 0.15), 0, 1);
+    }
+  }
+
+  const maxStreak = Math.max(maxRStreak, maxLStreak);
+  const streakScore = clamp((maxStreak - 3) / 6, 0, 1);
+  const eventDensity = clamp(total / 35, 0, 1);
+  const compositeScore =
+    balanceScore * 20 +
+    sweepScore * 45 +
+    streakScore * 20 +
+    eventDensity * 15;
+
+  const cheatingScore = clamp(Math.round(compositeScore), 0, 100);
+  const isCheating = cheatingScore >= 60;
+  const typewriterScore = clamp(Math.round(sweepScore * 100), 0, 100);
+  const isTypewriterMovement = typewriterScore >= 65 && streakScore > 0.5;
+  const confidence = getConfidence(cheatingScore, total);
+
+  let reason =
+    `Events: ${total}, alternation: ${(alternationRate * 100).toFixed(0)}%, ` +
+    `max sweep streak: ${maxStreak}.`;
+  if (transitions > rapidTransitions) {
+    reason += ` Ignored ${transitions - rapidTransitions} long pauses as natural thinking gaps.`;
+  }
+  if (streakScore < 0.4 && alternationRate > 0.3) {
+    reason += " High alternation with short streaks suggests darting, not reading.";
+  }
+
+  return {
+    isCheating,
+    cheatingScore,
+    isTypewriterMovement,
+    typewriterScore,
+    confidence,
+    summary: isCheating
+      ? "Pattern indicates long structured sweep movements consistent with reading from a second surface."
+      : "Pattern appears conversational, with natural pauses or unstructured eye motion.",
+    reason,
+    recommendation: isCheating
+      ? "Ask a direct follow-up and continue screen/camera monitoring."
+      : "Continue observing across more answer windows.",
+    pattern,
+    eventCount: total,
+  };
+}
+
 function createRoomState(roomId) {
   return {
     roomId,
@@ -733,6 +910,21 @@ function emitAiTranscriptUpdate(roomId) {
   });
 }
 
+function emitEyeAnalysisUpdate(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+
+  const snapshot = getOrCreateEyeState(roomId);
+  room.participants.forEach((participant) => {
+    if (participant.role === "interviewer") {
+      io.to(participant.socketId).emit("eye-analysis-update", {
+        ...snapshot.latest,
+        history: snapshot.history,
+      });
+    }
+  });
+}
+
 function scheduleAiAnalysis(roomId) {
   const state = getOrCreateAiState(roomId);
   state.status = "analyzing";
@@ -876,12 +1068,15 @@ function removeParticipant(roomId, peerId) {
   spacetime.removeParticipant(roomId, peerId);
   if (room.participants.size === 0) {
     clearAiState(roomId);
+    clearEyeState(roomId);
     rooms.delete(roomId);
     return;
   }
   if (removedParticipant?.role === "candidate") {
     clearAiState(roomId);
+    clearEyeState(roomId);
     emitAiScoreUpdate(roomId);
+    emitEyeAnalysisUpdate(roomId);
   }
   emitRoomState(roomId);
 }
@@ -1120,6 +1315,10 @@ io.on("connection", (socket) => {
         draft: getOrCreateAiState(roomId).liveDraft,
         mode: getOrCreateAiState(roomId).transcriptMode,
       });
+      socket.emit("eye-analysis-update", {
+        ...getOrCreateEyeState(roomId).latest,
+        history: getOrCreateEyeState(roomId).history,
+      });
     }
     socket.to(roomId).emit("peer-joined", serializeParticipant(participant));
 
@@ -1243,6 +1442,55 @@ io.on("connection", (socket) => {
 
     emitRoomState(roomId);
   });
+
+  socket.on(
+    "eye-movement-batch",
+    ({ roomId, peerId, movementEvents, phase }, callback) => {
+      const room = rooms.get(roomId);
+      const participant = room?.participants.get(peerId);
+
+      if (!room || !participant) {
+        callback?.({ ok: false, message: "Participant not found in room." });
+        return;
+      }
+
+      if (participant.socketId !== socket.id || participant.role !== "candidate") {
+        callback?.({ ok: false, message: "Only the candidate can send eye movement data." });
+        return;
+      }
+
+      const normalizedEvents = Array.isArray(movementEvents)
+        ? movementEvents.filter(
+            (event) =>
+              event &&
+              (event.direction === "L" || event.direction === "R"),
+          )
+        : [];
+
+      const analysis = analyzeEyeEventsHeuristically(
+        normalizedEvents,
+        phase || "ANSWER",
+      );
+      const eyeState = getOrCreateEyeState(roomId);
+      const snapshot = {
+        ...analysis,
+        lastUpdatedAt: Date.now(),
+      };
+
+      eyeState.latest = snapshot;
+      eyeState.history.push({
+        cheatingScore: snapshot.cheatingScore,
+        isCheating: snapshot.isCheating,
+        timestamp: snapshot.lastUpdatedAt,
+      });
+      if (eyeState.history.length > 8) {
+        eyeState.history.shift();
+      }
+
+      emitEyeAnalysisUpdate(roomId);
+      callback?.({ ok: true });
+    },
+  );
 
   socket.on(
     "candidate-live-transcript",
