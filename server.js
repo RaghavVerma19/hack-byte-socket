@@ -7,9 +7,11 @@ const path = require("path");
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const multer = require("multer");
 const twilio = require("twilio");
 const { execFile } = require("child_process");
 const { Server } = require("socket.io");
+const { analyzeResumePipeline } = require("./services/resume/resumeAnalyzer");
 
 const USERS_FILE = path.join(__dirname, "data", "users.json");
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
@@ -156,6 +158,28 @@ function compactWhitespace(input) {
   return String(input || "").replace(/\s+/g, " ").trim();
 }
 
+function pushTranscriptHistory(state, text) {
+  const normalizedTranscript = compactWhitespace(text);
+  if (!normalizedTranscript) {
+    return false;
+  }
+
+  const previousEntry = state.transcriptHistory[state.transcriptHistory.length - 1];
+  if (previousEntry?.text === normalizedTranscript) {
+    return false;
+  }
+
+  state.transcriptHistory.push({
+    text: normalizedTranscript,
+    createdAt: Date.now(),
+  });
+  if (state.transcriptHistory.length > AI_MAX_HISTORY) {
+    state.transcriptHistory.shift();
+  }
+
+  return true;
+}
+
 function getConfidence(score, eventCount) {
   if (eventCount < 10) {
     return "low";
@@ -209,7 +233,7 @@ function buildEmptyAiSnapshot() {
     transcriptCount: 0,
     updatedAt: null,
     status: "idle",
-    detail: "Waiting for candidate audio.",
+    detail: "Waiting for candidate speech.",
     transcriptMode: "waiting",
   };
 }
@@ -225,10 +249,10 @@ function getOrCreateAiState(roomId) {
       rollingAiLikelihood: null,
       confidence: "idle",
       updatedAt: null,
-      status: aiReview?.isTranscriptionEnabled?.() ? "listening" : "transcription_disabled",
-      detail: aiReview?.isTranscriptionEnabled?.()
+      status: aiReview?.isScoringEnabled?.() ? "listening" : "scoring_disabled",
+      detail: aiReview?.isScoringEnabled?.()
         ? "Listening for candidate speech."
-        : "Deepgram is not configured on the backend.",
+        : "Gemini is not configured on the backend.",
       transcriptMode: "waiting",
       liveDraft: "",
       pendingParagraph: "",
@@ -256,10 +280,7 @@ function getAiSnapshot(roomId) {
   const state = aiInterviewState.get(roomId);
   if (!state) {
     const snapshot = buildEmptyAiSnapshot();
-    if (!aiReview.isTranscriptionEnabled()) {
-      snapshot.status = "transcription_disabled";
-      snapshot.detail = "Deepgram is not configured on the backend.";
-    } else if (!aiReview.isScoringEnabled()) {
+    if (!aiReview.isScoringEnabled()) {
       snapshot.status = "scoring_disabled";
       snapshot.detail = "Gemini is not configured on the backend.";
     }
@@ -867,6 +888,12 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.json({ limit: "1mb" }));
+const resumeUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024,
+  },
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -1005,19 +1032,12 @@ function queueTranscriptForAnalysis(roomId, transcript) {
 
   const state = getOrCreateAiState(roomId);
   state.liveDraft = "";
-  const previousEntry = state.transcriptHistory[state.transcriptHistory.length - 1];
-  if (previousEntry?.text === normalizedTranscript) {
+  const addedToHistory = pushTranscriptHistory(state, normalizedTranscript);
+  if (!addedToHistory) {
     state.status = "listening";
     state.detail = "Repeated transcript ignored. Waiting for the next spoken phrase.";
     emitAiScoreUpdate(roomId);
     return;
-  }
-  state.transcriptHistory.push({
-    text: normalizedTranscript,
-    createdAt: Date.now(),
-  });
-  if (state.transcriptHistory.length > AI_MAX_HISTORY) {
-    state.transcriptHistory.shift();
   }
   emitAiTranscriptUpdate(roomId);
 
@@ -1088,8 +1108,12 @@ function updateLiveTranscript(roomId, text, isFinal) {
   state.transcriptMode = "browser";
 
   if (isFinal) {
+    pushTranscriptHistory(state, text);
     appendTranscriptForScoring(roomId, text);
+    state.status = "listening";
+    state.detail = "Captured finalized transcript from the candidate browser.";
     emitAiTranscriptUpdate(roomId);
+    emitAiScoreUpdate(roomId);
     return;
   }
 
@@ -1299,6 +1323,47 @@ app.get("/api/rtc/ice-servers", requireAuth, async (_, res) => {
       provider: "fallback",
       ttl: null,
       warning: "Twilio ICE fetch failed. Falling back to STUN only.",
+    });
+  }
+});
+
+app.post("/api/analyze-resume", requireAuth, resumeUpload.single("resume"), async (req, res) => {
+  if (req.user.role !== "interviewer") {
+    res.status(403).json({
+      success: false,
+      message: "Only interviewers can analyze resumes.",
+    });
+    return;
+  }
+
+  if (!req.file) {
+    res.status(400).json({
+      success: false,
+      message: "No resume file uploaded.",
+    });
+    return;
+  }
+
+  if (req.file.mimetype !== "application/pdf") {
+    res.status(400).json({
+      success: false,
+      message: "Only PDF files are supported.",
+    });
+    return;
+  }
+
+  try {
+    const result = await analyzeResumePipeline(req.file.buffer);
+    res.json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    console.error("[resume-analysis] failed", error.message);
+    res.status(error.statusCode || 500).json({
+      success: false,
+      message: "Failed to analyze resume pipeline.",
+      error: error.message,
     });
   }
 });

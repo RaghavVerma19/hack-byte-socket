@@ -10,9 +10,12 @@
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",
+    "cheerio": "^1.1.2",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.2",
+    "pdf-parse-new": "^1.4.1",
     "socket.io": "^4.8.1",
     "twilio": "^5.5.3"
   }
