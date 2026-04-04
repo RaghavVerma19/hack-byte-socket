@@ -162,6 +162,7 @@ function buildEmptyAiSnapshot() {
     updatedAt: null,
     status: "idle",
     detail: "Waiting for candidate audio.",
+    transcriptMode: "waiting",
   };
 }
 
@@ -180,6 +181,8 @@ function getOrCreateAiState(roomId) {
       detail: aiReview?.isTranscriptionEnabled?.()
         ? "Listening for candidate speech."
         : "Deepgram is not configured on the backend.",
+      transcriptMode: "waiting",
+      liveDraft: "",
       analysisTimer: null,
       analysisPromise: Promise.resolve(),
     });
@@ -219,6 +222,7 @@ function getAiSnapshot(roomId) {
     updatedAt: state.updatedAt,
     status: state.status,
     detail: state.detail,
+    transcriptMode: state.transcriptMode,
   };
 }
 
@@ -719,7 +723,11 @@ function emitAiTranscriptUpdate(roomId) {
   const transcripts = state.transcriptHistory.slice(-4);
   room.participants.forEach((participant) => {
     if (participant.role === "interviewer") {
-      io.to(participant.socketId).emit("ai-transcript-update", { transcripts });
+      io.to(participant.socketId).emit("ai-transcript-update", {
+        transcripts,
+        draft: state.liveDraft,
+        mode: state.transcriptMode,
+      });
     }
   });
 }
@@ -795,6 +803,7 @@ function queueTranscriptForAnalysis(roomId, transcript) {
   }
 
   const state = getOrCreateAiState(roomId);
+  state.liveDraft = "";
   state.transcriptHistory.push({
     text: normalizedTranscript,
     createdAt: Date.now(),
@@ -820,6 +829,26 @@ function queueTranscriptForAnalysis(roomId, transcript) {
 
   emitAiScoreUpdate(roomId);
   scheduleAiAnalysis(roomId);
+}
+
+function updateLiveTranscript(roomId, text, isFinal) {
+  const state = getOrCreateAiState(roomId);
+  state.transcriptMode = "browser";
+
+  if (isFinal) {
+    queueTranscriptForAnalysis(roomId, text);
+    emitAiTranscriptUpdate(roomId);
+    return;
+  }
+
+  state.liveDraft = compactWhitespace(text);
+  state.transcriptMode = "streaming";
+  state.status = "listening";
+  state.detail = state.liveDraft
+    ? "Streaming live transcript from the candidate browser."
+    : "Listening for candidate speech.";
+  emitAiScoreUpdate(roomId);
+  emitAiTranscriptUpdate(roomId);
 }
 
 function emitRoomState(roomId) {
@@ -1080,6 +1109,8 @@ io.on("connection", (socket) => {
       socket.emit("ai-score-update", getAiSnapshot(roomId));
       socket.emit("ai-transcript-update", {
         transcripts: getOrCreateAiState(roomId).transcriptHistory.slice(-4),
+        draft: getOrCreateAiState(roomId).liveDraft,
+        mode: getOrCreateAiState(roomId).transcriptMode,
       });
     }
     socket.to(roomId).emit("peer-joined", serializeParticipant(participant));
@@ -1206,6 +1237,32 @@ io.on("connection", (socket) => {
   });
 
   socket.on(
+    "candidate-live-transcript",
+    ({ roomId, peerId, text, isFinal }, callback) => {
+      const room = rooms.get(roomId);
+      const participant = room?.participants.get(peerId);
+
+      if (!room || !participant) {
+        callback?.({ ok: false, message: "Participant not found in room." });
+        return;
+      }
+
+      if (participant.socketId !== socket.id || participant.role !== "candidate") {
+        callback?.({ ok: false, message: "Only the candidate can stream transcript updates." });
+        return;
+      }
+
+      if (!buildRoomState(room).interviewStarted) {
+        callback?.({ ok: false, message: "Interview transcription is available only after the interview starts." });
+        return;
+      }
+
+      updateLiveTranscript(roomId, text, Boolean(isFinal));
+      callback?.({ ok: true });
+    },
+  );
+
+  socket.on(
     "candidate-audio-chunk",
     async ({ roomId, peerId, mimeType, audioBase64 }, callback) => {
       const room = rooms.get(roomId);
@@ -1234,6 +1291,7 @@ io.on("connection", (socket) => {
       try {
         const aiState = getOrCreateAiState(roomId);
         aiState.chunkCount += 1;
+        aiState.transcriptMode = "deepgram";
         aiState.status = "listening";
         aiState.detail = "Audio chunk received. Transcribing candidate speech.";
         emitAiScoreUpdate(roomId);
