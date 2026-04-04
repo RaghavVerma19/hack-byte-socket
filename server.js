@@ -667,7 +667,7 @@ function analyzeEyeEventsHeuristically(movementEvents, phase) {
     };
   }
 
-  if (total < 10) {
+  if (total < 14) {
     return {
       isCheating: false,
       cheatingScore: 0,
@@ -690,6 +690,7 @@ function analyzeEyeEventsHeuristically(movementEvents, phase) {
   let maxLStreak = 0;
   let currentStreak = 1;
   let currentDir = movementEvents[0].direction;
+  const streaks = [];
 
   for (let index = 1; index < total; index += 1) {
     const current = movementEvents[index];
@@ -698,6 +699,7 @@ function analyzeEyeEventsHeuristically(movementEvents, phase) {
     if (current.direction === currentDir) {
       currentStreak += 1;
     } else {
+      streaks.push({ direction: currentDir, length: currentStreak });
       if (currentDir === "R") maxRStreak = Math.max(maxRStreak, currentStreak);
       if (currentDir === "L") maxLStreak = Math.max(maxLStreak, currentStreak);
       currentDir = current.direction;
@@ -718,47 +720,82 @@ function analyzeEyeEventsHeuristically(movementEvents, phase) {
     }
   }
 
+  streaks.push({ direction: currentDir, length: currentStreak });
   if (currentDir === "R") maxRStreak = Math.max(maxRStreak, currentStreak);
   if (currentDir === "L") maxLStreak = Math.max(maxLStreak, currentStreak);
 
-  const alternationRate = rapidTransitions / (total - 1);
+  const alternationRate = rapidTransitions / Math.max(total - 1, 1);
   const rightBias = rightCount / total;
-  let balanceRaw = 1 - Math.abs(rightBias - 0.5);
-  const balanceScore = clamp(balanceRaw * 1.5, 0, 1);
+  const sideBalanceScore = clamp(1 - Math.abs(rightBias - 0.5) * 1.7, 0, 1);
+  const maxStreak = Math.max(maxRStreak, maxLStreak);
 
-  let sweepScore = 0;
-  if (alternationRate >= 0.03 && alternationRate <= 0.4) {
-    if (alternationRate >= 0.05 && alternationRate <= 0.25) {
-      sweepScore = 1;
-    } else if (alternationRate < 0.05) {
-      sweepScore = alternationRate / 0.05;
-    } else {
-      sweepScore = clamp(1 - ((alternationRate - 0.25) / 0.15), 0, 1);
+  let lineSweepCycles = 0;
+  let longSweepStreaks = 0;
+  let shortResetStreaks = 0;
+  let dartingPenalty = 0;
+
+  streaks.forEach((streak) => {
+    if (streak.length >= 3) {
+      longSweepStreaks += 1;
+    }
+    if (streak.length <= 2) {
+      shortResetStreaks += 1;
+    }
+  });
+
+  for (let index = 0; index < streaks.length - 1; index += 1) {
+    const current = streaks[index];
+    const next = streaks[index + 1];
+    const isReadingCycle =
+      current.direction !== next.direction &&
+      current.length >= 3 &&
+      next.length >= 1 &&
+      next.length <= Math.max(3, current.length - 1);
+
+    if (isReadingCycle) {
+      lineSweepCycles += 1;
     }
   }
 
-  const maxStreak = Math.max(maxRStreak, maxLStreak);
-  const streakScore = clamp((maxStreak - 3) / 6, 0, 1);
-  const eventDensity = clamp(total / 35, 0, 1);
+  if (alternationRate > 0.45 && maxStreak <= 2) {
+    dartingPenalty = clamp((alternationRate - 0.45) / 0.35, 0, 1);
+  }
+
+  const cycleScore = clamp(lineSweepCycles / 5, 0, 1);
+  const structuredSweepScore =
+    streaks.length > 0 ? clamp(longSweepStreaks / streaks.length, 0, 1) : 0;
+  const resetDisciplineScore =
+    streaks.length > 0 ? clamp(shortResetStreaks / streaks.length, 0, 1) : 0;
+  const eventDensity = clamp((total - 10) / 28, 0, 1);
   const compositeScore =
-    balanceScore * 20 +
-    sweepScore * 45 +
-    streakScore * 20 +
-    eventDensity * 15;
+    cycleScore * 42 +
+    structuredSweepScore * 23 +
+    sideBalanceScore * 15 +
+    resetDisciplineScore * 12 +
+    eventDensity * 8 -
+    dartingPenalty * 28;
 
   const cheatingScore = clamp(Math.round(compositeScore), 0, 100);
-  const isCheating = cheatingScore >= 60;
-  const typewriterScore = clamp(Math.round(sweepScore * 100), 0, 100);
-  const isTypewriterMovement = typewriterScore >= 65 && streakScore > 0.5;
+  const isCheating = cheatingScore >= 68 && lineSweepCycles >= 3 && maxStreak >= 3;
+  const typewriterScore = clamp(
+    Math.round(cycleScore * 70 + structuredSweepScore * 20 + resetDisciplineScore * 10),
+    0,
+    100,
+  );
+  const isTypewriterMovement =
+    typewriterScore >= 68 && lineSweepCycles >= 3 && structuredSweepScore >= 0.45;
   const confidence = getConfidence(cheatingScore, total);
 
   let reason =
-    `Events: ${total}, Alt rate: ${(alternationRate * 100).toFixed(0)}%, Max sweep streak: ${maxStreak}.`;
+    `Events: ${total}, line-sweep cycles: ${lineSweepCycles}, max sweep streak: ${maxStreak}.`;
   if (transitions > rapidTransitions) {
     reason += ` Ignored ${transitions - rapidTransitions} long pauses (natural thinking).`;
   }
-  if (streakScore < 0.4 && alternationRate > 0.3) {
-    reason += " High alternation but short streaks indicates nervous darting, not reading.";
+  if (dartingPenalty > 0) {
+    reason += " Fast short alternations looked more like nervous darting than line-by-line reading.";
+  }
+  if (isTypewriterMovement) {
+    reason += " Candidate appears to be reading line by line across the screen.";
   }
 
   return {
@@ -768,8 +805,8 @@ function analyzeEyeEventsHeuristically(movementEvents, phase) {
     typewriterScore,
     confidence,
     summary: isCheating
-      ? "Pattern indicates highly structured, long sweep movements consistent with screen reading."
-      : "Pattern appears conversational, consisting of natural thought pauses or unstructured darting.",
+      ? "Pattern matches repeated line-by-line reading sweeps across the screen."
+      : "Pattern looks closer to natural thinking pauses and unstructured conversational eye movement.",
     reason,
     recommendation: isCheating
       ? "Ask a follow-up that requires direct recall and maintain observation."
