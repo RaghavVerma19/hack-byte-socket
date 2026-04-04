@@ -29,6 +29,9 @@ const AI_ANALYSIS_MIN_WORDS = Number(process.env.AI_ANALYSIS_MIN_WORDS || 6);
 const AI_MAX_SEGMENTS = Number(process.env.AI_MAX_SEGMENTS || 6);
 const AI_MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 8);
 const AI_ANALYSIS_DEBOUNCE_MS = Number(process.env.AI_ANALYSIS_DEBOUNCE_MS || 2000);
+const AI_PARAGRAPH_MIN_WORDS = Number(process.env.AI_PARAGRAPH_MIN_WORDS || 24);
+const AI_PARAGRAPH_SOFT_MIN_WORDS = Number(process.env.AI_PARAGRAPH_SOFT_MIN_WORDS || 12);
+const AI_PARAGRAPH_FLUSH_MS = Number(process.env.AI_PARAGRAPH_FLUSH_MS || 4000);
 const authRateLimiter = new Map();
 const aiInterviewState = new Map();
 const eyeAnalysisState = new Map();
@@ -228,6 +231,8 @@ function getOrCreateAiState(roomId) {
         : "Deepgram is not configured on the backend.",
       transcriptMode: "waiting",
       liveDraft: "",
+      pendingParagraph: "",
+      paragraphTimer: null,
       analysisTimer: null,
       analysisPromise: Promise.resolve(),
     });
@@ -240,6 +245,9 @@ function clearAiState(roomId) {
   const state = aiInterviewState.get(roomId);
   if (state?.analysisTimer) {
     clearTimeout(state.analysisTimer);
+  }
+  if (state?.paragraphTimer) {
+    clearTimeout(state.paragraphTimer);
   }
   aiInterviewState.delete(roomId);
 }
@@ -1031,12 +1039,56 @@ function queueTranscriptForAnalysis(roomId, transcript) {
   scheduleAiAnalysis(roomId);
 }
 
+function flushPendingParagraph(roomId) {
+  const state = getOrCreateAiState(roomId);
+  if (state.paragraphTimer) {
+    clearTimeout(state.paragraphTimer);
+    state.paragraphTimer = null;
+  }
+
+  const paragraph = compactWhitespace(state.pendingParagraph);
+  state.pendingParagraph = "";
+  if (!paragraph) {
+    return;
+  }
+
+  queueTranscriptForAnalysis(roomId, paragraph);
+}
+
+function appendTranscriptForScoring(roomId, transcript) {
+  const normalizedTranscript = compactWhitespace(transcript);
+  if (!normalizedTranscript) return;
+
+  const state = getOrCreateAiState(roomId);
+  state.pendingParagraph = compactWhitespace(
+    `${state.pendingParagraph ? `${state.pendingParagraph} ` : ""}${normalizedTranscript}`,
+  );
+
+  if (state.paragraphTimer) {
+    clearTimeout(state.paragraphTimer);
+  }
+
+  const paragraphWordCount = countWords(state.pendingParagraph);
+  const endsSentence = /[.!?]$/.test(state.pendingParagraph);
+  if (
+    paragraphWordCount >= AI_PARAGRAPH_MIN_WORDS ||
+    (endsSentence && paragraphWordCount >= AI_PARAGRAPH_SOFT_MIN_WORDS)
+  ) {
+    flushPendingParagraph(roomId);
+    return;
+  }
+
+  state.paragraphTimer = setTimeout(() => {
+    flushPendingParagraph(roomId);
+  }, AI_PARAGRAPH_FLUSH_MS);
+}
+
 function updateLiveTranscript(roomId, text, isFinal) {
   const state = getOrCreateAiState(roomId);
   state.transcriptMode = "browser";
 
   if (isFinal) {
-    queueTranscriptForAnalysis(roomId, text);
+    appendTranscriptForScoring(roomId, text);
     emitAiTranscriptUpdate(roomId);
     return;
   }
