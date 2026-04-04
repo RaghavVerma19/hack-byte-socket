@@ -628,7 +628,7 @@ function analyzeEyeEventsHeuristically(movementEvents, phase) {
       confidence: "high",
       summary: `Pattern ignored because phase is ${phase}.`,
       reason: "Candidate is not actively answering a question.",
-      recommendation: "Wait for the candidate to continue answering.",
+      recommendation: "Wait for candidate to begin answering.",
       pattern,
       eventCount: total,
     };
@@ -642,8 +642,8 @@ function analyzeEyeEventsHeuristically(movementEvents, phase) {
       typewriterScore: 0,
       confidence: "low",
       summary: "Not enough eye movement data.",
-      reason: `Only ${total} events were captured in this window.`,
-      recommendation: "Continue monitoring the candidate feed.",
+      reason: `Only ${total} events recorded in this window.`,
+      recommendation: "Continue monitoring.",
       pattern,
       eventCount: total,
     };
@@ -688,9 +688,9 @@ function analyzeEyeEventsHeuristically(movementEvents, phase) {
   if (currentDir === "R") maxRStreak = Math.max(maxRStreak, currentStreak);
   if (currentDir === "L") maxLStreak = Math.max(maxLStreak, currentStreak);
 
-  const alternationRate = rapidTransitions / Math.max(total - 1, 1);
+  const alternationRate = rapidTransitions / (total - 1);
   const rightBias = rightCount / total;
-  const balanceRaw = 1 - Math.abs(rightBias - 0.5);
+  let balanceRaw = 1 - Math.abs(rightBias - 0.5);
   const balanceScore = clamp(balanceRaw * 1.5, 0, 1);
 
   let sweepScore = 0;
@@ -720,13 +720,12 @@ function analyzeEyeEventsHeuristically(movementEvents, phase) {
   const confidence = getConfidence(cheatingScore, total);
 
   let reason =
-    `Events: ${total}, alternation: ${(alternationRate * 100).toFixed(0)}%, ` +
-    `max sweep streak: ${maxStreak}.`;
+    `Events: ${total}, Alt rate: ${(alternationRate * 100).toFixed(0)}%, Max sweep streak: ${maxStreak}.`;
   if (transitions > rapidTransitions) {
-    reason += ` Ignored ${transitions - rapidTransitions} long pauses as natural thinking gaps.`;
+    reason += ` Ignored ${transitions - rapidTransitions} long pauses (natural thinking).`;
   }
   if (streakScore < 0.4 && alternationRate > 0.3) {
-    reason += " High alternation with short streaks suggests darting, not reading.";
+    reason += " High alternation but short streaks indicates nervous darting, not reading.";
   }
 
   return {
@@ -736,16 +735,109 @@ function analyzeEyeEventsHeuristically(movementEvents, phase) {
     typewriterScore,
     confidence,
     summary: isCheating
-      ? "Pattern indicates long structured sweep movements consistent with reading from a second surface."
-      : "Pattern appears conversational, with natural pauses or unstructured eye motion.",
+      ? "Pattern indicates highly structured, long sweep movements consistent with screen reading."
+      : "Pattern appears conversational, consisting of natural thought pauses or unstructured darting.",
     reason,
     recommendation: isCheating
-      ? "Ask a direct follow-up and continue screen/camera monitoring."
-      : "Continue observing across more answer windows.",
+      ? "Ask a follow-up that requires direct recall and maintain observation."
+      : "Continue monitoring across additional windows for consistency.",
     pattern,
     eventCount: total,
   };
 }
+
+app.post("/analyze-eye-movement", (req, res) => {
+  try {
+    const { movementEvents, eyeMovement, phase, sessionContext } = req.body || {};
+
+    const normalizedEvents =
+      Array.isArray(movementEvents) && movementEvents.length > 0
+        ? movementEvents
+        : String(eyeMovement || "")
+            .split("")
+            .filter((value) => value === "L" || value === "R")
+            .map((direction) => ({ direction, timestamp: null }));
+
+    if (!phase) {
+      res.status(400).json({ error: "Missing phase" });
+      return;
+    }
+
+    const firstTimestamp = normalizedEvents[0]?.timestamp || null;
+    const lastTimestamp = normalizedEvents[normalizedEvents.length - 1]?.timestamp || null;
+    const analyzed = analyzeEyeEventsHeuristically(normalizedEvents, phase);
+
+    res.json({
+      phase,
+      isCheating: analyzed.isCheating,
+      cheatingScore: analyzed.cheatingScore,
+      isTypewriterMovement: analyzed.isTypewriterMovement,
+      typewriterScore: analyzed.typewriterScore,
+      confidence: analyzed.confidence,
+      summary: analyzed.summary,
+      reason: analyzed.reason,
+      recommendation: analyzed.recommendation,
+      windowStart: firstTimestamp,
+      windowEnd: lastTimestamp,
+      eventCount: analyzed.eventCount,
+      pattern: analyzed.pattern,
+      sessionContext: sessionContext || null,
+    });
+  } catch (error) {
+    console.error("Error analyzing eye movement:", error);
+    const message = String(error?.message || "Unknown error");
+    res.status(500).json({ error: "Failed to analyze eye movement", details: message });
+  }
+});
+
+app.post("/analyze-session", (req, res) => {
+  try {
+    const { eyeMovements, phase, questionContext } = req.body || {};
+
+    if (!Array.isArray(eyeMovements) || !phase) {
+      res.status(400).json({ error: "Invalid request format" });
+      return;
+    }
+
+    const flattened = eyeMovements
+      .flatMap((value) => String(value || "").split(""))
+      .filter((value) => value === "L" || value === "R")
+      .map((direction) => ({ direction, timestamp: null }));
+
+    if (flattened.length === 0) {
+      res.json({
+        overallAssessment: "neutral",
+        readingProbability: 0,
+        patterns: ["No valid directional events found in session payload"],
+        confidence: "low",
+        additionalNotes: "Unable to analyze session without L/R movement data.",
+      });
+      return;
+    }
+
+    const result = analyzeEyeEventsHeuristically(flattened, phase);
+    const overallAssessment =
+      result.cheatingScore >= 70
+        ? "reading"
+        : result.cheatingScore >= 45
+          ? "distracted"
+          : "focused";
+
+    res.json({
+      overallAssessment,
+      readingProbability: result.cheatingScore,
+      patterns: [
+        `Pattern sample: ${result.pattern.slice(0, 50)}${result.pattern.length > 50 ? "..." : ""}`,
+        result.reason,
+      ],
+      confidence: result.confidence,
+      additionalNotes: questionContext || "Heuristic session-level analysis completed.",
+    });
+  } catch (error) {
+    console.error("Error analyzing session:", error);
+    res.status(500).json({ error: "Failed to analyze session", details: error.message });
+  }
+});
 
 function createRoomState(roomId) {
   return {
