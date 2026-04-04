@@ -147,7 +147,15 @@ async function extractJsonWithGemini(prompt) {
 async function extractResumeData(pdfBuffer, hyperlinks = []) {
   const rawText = await extractTextFromPdf(pdfBuffer);
   const prompt = buildResumeExtractionPrompt(rawText, hyperlinks);
-  const extractedData = await extractJsonWithGemini(prompt);
+  let extractedData;
+
+  try {
+    extractedData = await extractJsonWithGemini(prompt);
+  } catch (error) {
+    console.error("[resume-extractor] Gemini extraction failed, using fallback:", error.message);
+    extractedData = fallbackExtractResumeData(rawText);
+  }
+
   return { rawText, extractedData };
 }
 
