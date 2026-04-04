@@ -24,8 +24,8 @@ const TWILIO_NTS_TTL = Number(process.env.TWILIO_NTS_TTL || 3600);
 const ROOM_ID_PATTERN = /^[a-zA-Z0-9_-]{3,120}$/;
 const DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL || "nova-2";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash-lite";
-const AI_TRANSCRIPT_MIN_WORDS = Number(process.env.AI_TRANSCRIPT_MIN_WORDS || 12);
-const AI_ANALYSIS_MIN_WORDS = Number(process.env.AI_ANALYSIS_MIN_WORDS || 30);
+const AI_TRANSCRIPT_MIN_WORDS = Number(process.env.AI_TRANSCRIPT_MIN_WORDS || 6);
+const AI_ANALYSIS_MIN_WORDS = Number(process.env.AI_ANALYSIS_MIN_WORDS || 14);
 const AI_MAX_SEGMENTS = Number(process.env.AI_MAX_SEGMENTS || 6);
 const AI_MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 8);
 const AI_ANALYSIS_DEBOUNCE_MS = Number(process.env.AI_ANALYSIS_DEBOUNCE_MS || 7000);
@@ -157,6 +157,8 @@ function buildEmptyAiSnapshot() {
     aiLikelihood: null,
     confidence: "idle",
     samplesAnalyzed: 0,
+    chunkCount: 0,
+    transcriptCount: 0,
     updatedAt: null,
     status: "idle",
     detail: "Waiting for candidate audio.",
@@ -168,7 +170,9 @@ function getOrCreateAiState(roomId) {
     aiInterviewState.set(roomId, {
       roomId,
       transcriptSegments: [],
+      transcriptHistory: [],
       scoreHistory: [],
+      chunkCount: 0,
       rollingAiLikelihood: null,
       confidence: "idle",
       updatedAt: null,
@@ -210,6 +214,8 @@ function getAiSnapshot(roomId) {
     aiLikelihood: state.rollingAiLikelihood,
     confidence: state.confidence,
     samplesAnalyzed: state.scoreHistory.length,
+    chunkCount: state.chunkCount,
+    transcriptCount: state.transcriptHistory.length,
     updatedAt: state.updatedAt,
     status: state.status,
     detail: state.detail,
@@ -700,10 +706,24 @@ function emitAiScoreUpdate(roomId) {
   });
 }
 
+function emitAiTranscriptUpdate(roomId) {
+  const room = rooms.get(roomId);
+  const state = aiInterviewState.get(roomId);
+  if (!room || !state) return;
+
+  const transcripts = state.transcriptHistory.slice(-4);
+  room.participants.forEach((participant) => {
+    if (participant.role === "interviewer") {
+      io.to(participant.socketId).emit("ai-transcript-update", { transcripts });
+    }
+  });
+}
+
 function scheduleAiAnalysis(roomId) {
   const state = getOrCreateAiState(roomId);
   state.status = "analyzing";
   state.detail = "Analyzing recent candidate response.";
+  emitAiScoreUpdate(roomId);
   if (state.analysisTimer) {
     clearTimeout(state.analysisTimer);
   }
@@ -722,6 +742,7 @@ function runAiAnalysis(roomId) {
       if (countWords(transcriptWindow) < AI_ANALYSIS_MIN_WORDS) {
         state.status = "listening";
         state.detail = "Waiting for a longer spoken answer.";
+        emitAiScoreUpdate(roomId);
         return;
       }
 
@@ -750,6 +771,7 @@ function runAiAnalysis(roomId) {
         console.error("[ai-review] scoring failed", error.message);
         state.status = "error";
         state.detail = "Gemini scoring is temporarily unavailable.";
+        emitAiScoreUpdate(roomId);
       }
     })
     .catch((error) => {
@@ -759,11 +781,27 @@ function runAiAnalysis(roomId) {
 
 function queueTranscriptForAnalysis(roomId, transcript) {
   const normalizedTranscript = compactWhitespace(transcript);
-  if (!normalizedTranscript || countWords(normalizedTranscript) < AI_TRANSCRIPT_MIN_WORDS) {
+  if (!normalizedTranscript) {
     return;
   }
 
   const state = getOrCreateAiState(roomId);
+  state.transcriptHistory.push({
+    text: normalizedTranscript,
+    createdAt: Date.now(),
+  });
+  if (state.transcriptHistory.length > AI_MAX_HISTORY) {
+    state.transcriptHistory.shift();
+  }
+  emitAiTranscriptUpdate(roomId);
+
+  if (countWords(normalizedTranscript) < AI_TRANSCRIPT_MIN_WORDS) {
+    state.status = "listening";
+    state.detail = "Short speech captured. Waiting for a longer answer.";
+    emitAiScoreUpdate(roomId);
+    return;
+  }
+
   state.transcriptSegments.push(normalizedTranscript);
   state.status = "listening";
   state.detail = "Captured candidate speech. Preparing the next analysis window.";
@@ -771,6 +809,7 @@ function queueTranscriptForAnalysis(roomId, transcript) {
     state.transcriptSegments.shift();
   }
 
+  emitAiScoreUpdate(roomId);
   scheduleAiAnalysis(roomId);
 }
 
@@ -1030,6 +1069,9 @@ io.on("connection", (socket) => {
     socket.emit("room-state", buildRoomState(room));
     if (normalizedRole === "interviewer") {
       socket.emit("ai-score-update", getAiSnapshot(roomId));
+      socket.emit("ai-transcript-update", {
+        transcripts: getOrCreateAiState(roomId).transcriptHistory.slice(-4),
+      });
     }
     socket.to(roomId).emit("peer-joined", serializeParticipant(participant));
 
@@ -1181,6 +1223,12 @@ io.on("connection", (socket) => {
       }
 
       try {
+        const aiState = getOrCreateAiState(roomId);
+        aiState.chunkCount += 1;
+        aiState.status = "listening";
+        aiState.detail = "Audio chunk received. Transcribing candidate speech.";
+        emitAiScoreUpdate(roomId);
+
         const audioBuffer = Buffer.from(audioBase64, "base64");
         if (!audioBuffer.length) {
           callback?.({ ok: true, skipped: true });
@@ -1190,11 +1238,19 @@ io.on("connection", (socket) => {
         const transcript = await aiReview.transcribeChunk(audioBuffer, mimeType);
         if (transcript) {
           queueTranscriptForAnalysis(roomId, transcript);
+        } else {
+          aiState.status = "listening";
+          aiState.detail = "Audio received, but no clear speech was transcribed.";
+          emitAiScoreUpdate(roomId);
         }
 
         callback?.({ ok: true });
       } catch (error) {
         console.error("[ai-review] transcription failed", error.message);
+        const aiState = getOrCreateAiState(roomId);
+        aiState.status = "error";
+        aiState.detail = "Deepgram transcription failed for the latest audio chunk.";
+        emitAiScoreUpdate(roomId);
         callback?.({ ok: false, message: "Unable to process interview audio right now." });
       }
     },
