@@ -4,10 +4,15 @@
   "private": true,
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "spacetime:build": "spacetime build --module-path spacetimedb",
+    "spacetime:typecheck": "npm --prefix spacetimedb run typecheck"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
     "socket.io": "^4.8.1"
   }
 }

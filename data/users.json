@@ -1,0 +1,16 @@
+[
+  {
+    "id": "6e30714d-5d32-477e-9c36-54d026a9d7f3",
+    "email": "raghavverma@123gmail.com",
+    "passwordHash": "$2b$10$.od/6c3h47CmbUfNHtD7ouFX.Yo2f6A/ZWLb1n19C1EXUJqhAVdeq",
+    "role": "interviewer",
+    "createdAt": 1775282363432
+  },
+  {
+    "id": "4792d00c-31f7-4a42-9519-567e9629fc65",
+    "email": "raghavverma1908@gmail.com",
+    "passwordHash": "$2b$10$s9ixr0eL3b7jqDcIN2VW8u2BY0zQgDs05kZLASMcUbwUP73JT.6R2",
+    "role": "interviewer",
+    "createdAt": 1775287657689
+  }
+]

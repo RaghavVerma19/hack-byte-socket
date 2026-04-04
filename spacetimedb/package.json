@@ -1,0 +1,14 @@
+{
+  "name": "hackbyte-interview-state",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "spacetimedb": "^1.4.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}
