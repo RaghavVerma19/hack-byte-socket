@@ -23,7 +23,7 @@ const AUTH_MAX_REQUESTS = Number(process.env.AUTH_RATE_LIMIT_MAX_REQUESTS || 20)
 const TWILIO_NTS_TTL = Number(process.env.TWILIO_NTS_TTL || 3600);
 const ROOM_ID_PATTERN = /^[a-zA-Z0-9_-]{3,120}$/;
 const DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL || "nova-2";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash-lite";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const AI_TRANSCRIPT_MIN_WORDS = Number(process.env.AI_TRANSCRIPT_MIN_WORDS || 1);
 const AI_ANALYSIS_MIN_WORDS = Number(process.env.AI_ANALYSIS_MIN_WORDS || 6);
 const AI_MAX_SEGMENTS = Number(process.env.AI_MAX_SEGMENTS || 6);
@@ -520,7 +520,8 @@ function createAiReviewService() {
       );
 
       if (!response.ok) {
-        throw new Error(`Gemini request failed with ${response.status}`);
+        const errorBody = await response.text();
+        throw new Error(`Gemini request failed with ${response.status}: ${errorBody.slice(0, 200)}`);
       }
 
       const payload = await response.json();
@@ -787,7 +788,7 @@ function runAiAnalysis(roomId) {
       } catch (error) {
         console.error("[ai-review] scoring failed", error.message);
         state.status = "error";
-        state.detail = "Gemini scoring is temporarily unavailable.";
+        state.detail = `Gemini scoring failed: ${error.message}`;
         emitAiScoreUpdate(roomId);
       }
     })
@@ -804,6 +805,13 @@ function queueTranscriptForAnalysis(roomId, transcript) {
 
   const state = getOrCreateAiState(roomId);
   state.liveDraft = "";
+  const previousEntry = state.transcriptHistory[state.transcriptHistory.length - 1];
+  if (previousEntry?.text === normalizedTranscript) {
+    state.status = "listening";
+    state.detail = "Repeated transcript ignored. Waiting for the next spoken phrase.";
+    emitAiScoreUpdate(roomId);
+    return;
+  }
   state.transcriptHistory.push({
     text: normalizedTranscript,
     createdAt: Date.now(),
