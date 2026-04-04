@@ -158,6 +158,8 @@ function buildEmptyAiSnapshot() {
     confidence: "idle",
     samplesAnalyzed: 0,
     updatedAt: null,
+    status: "idle",
+    detail: "Waiting for candidate audio.",
   };
 }
 
@@ -170,6 +172,10 @@ function getOrCreateAiState(roomId) {
       rollingAiLikelihood: null,
       confidence: "idle",
       updatedAt: null,
+      status: aiReview?.isTranscriptionEnabled?.() ? "listening" : "transcription_disabled",
+      detail: aiReview?.isTranscriptionEnabled?.()
+        ? "Listening for candidate speech."
+        : "Deepgram is not configured on the backend.",
       analysisTimer: null,
       analysisPromise: Promise.resolve(),
     });
@@ -188,13 +194,25 @@ function clearAiState(roomId) {
 
 function getAiSnapshot(roomId) {
   const state = aiInterviewState.get(roomId);
-  if (!state) return buildEmptyAiSnapshot();
+  if (!state) {
+    const snapshot = buildEmptyAiSnapshot();
+    if (!aiReview.isTranscriptionEnabled()) {
+      snapshot.status = "transcription_disabled";
+      snapshot.detail = "Deepgram is not configured on the backend.";
+    } else if (!aiReview.isScoringEnabled()) {
+      snapshot.status = "scoring_disabled";
+      snapshot.detail = "Gemini is not configured on the backend.";
+    }
+    return snapshot;
+  }
 
   return {
     aiLikelihood: state.rollingAiLikelihood,
     confidence: state.confidence,
     samplesAnalyzed: state.scoreHistory.length,
     updatedAt: state.updatedAt,
+    status: state.status,
+    detail: state.detail,
   };
 }
 
@@ -684,6 +702,8 @@ function emitAiScoreUpdate(roomId) {
 
 function scheduleAiAnalysis(roomId) {
   const state = getOrCreateAiState(roomId);
+  state.status = "analyzing";
+  state.detail = "Analyzing recent candidate response.";
   if (state.analysisTimer) {
     clearTimeout(state.analysisTimer);
   }
@@ -700,6 +720,8 @@ function runAiAnalysis(roomId) {
     .then(async () => {
       const transcriptWindow = state.transcriptSegments.slice(-3).join(" ").trim();
       if (countWords(transcriptWindow) < AI_ANALYSIS_MIN_WORDS) {
+        state.status = "listening";
+        state.detail = "Waiting for a longer spoken answer.";
         return;
       }
 
@@ -721,9 +743,13 @@ function runAiAnalysis(roomId) {
         state.rollingAiLikelihood = Math.round(average);
         state.confidence = result.confidence;
         state.updatedAt = Date.now();
+        state.status = "ready";
+        state.detail = "Live AI likelihood updated from recent response.";
         emitAiScoreUpdate(roomId);
       } catch (error) {
         console.error("[ai-review] scoring failed", error.message);
+        state.status = "error";
+        state.detail = "Gemini scoring is temporarily unavailable.";
       }
     })
     .catch((error) => {
@@ -739,6 +765,8 @@ function queueTranscriptForAnalysis(roomId, transcript) {
 
   const state = getOrCreateAiState(roomId);
   state.transcriptSegments.push(normalizedTranscript);
+  state.status = "listening";
+  state.detail = "Captured candidate speech. Preparing the next analysis window.";
   if (state.transcriptSegments.length > AI_MAX_SEGMENTS) {
     state.transcriptSegments.shift();
   }
@@ -933,9 +961,12 @@ app.get("/api/rtc/ice-servers", requireAuth, async (_, res) => {
     });
   } catch (error) {
     console.error("[twilio] failed to create network traversal token", error.message);
-    res.status(502).json({
-      ok: false,
-      message: "Unable to fetch ICE servers right now.",
+    res.json({
+      ok: true,
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      provider: "fallback",
+      ttl: null,
+      warning: "Twilio ICE fetch failed. Falling back to STUN only.",
     });
   }
 });
