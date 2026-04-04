@@ -7,6 +7,7 @@ const path = require("path");
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const twilio = require("twilio");
 const { execFile } = require("child_process");
 const { Server } = require("socket.io");
 
@@ -19,6 +20,7 @@ const SPACETIME_CLI_PATH =
   "C:\\Users\\DELL\\AppData\\Local\\SpacetimeDB\\spacetime.exe";
 const AUTH_WINDOW_MS = Number(process.env.AUTH_RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000);
 const AUTH_MAX_REQUESTS = Number(process.env.AUTH_RATE_LIMIT_MAX_REQUESTS || 20);
+const TWILIO_NTS_TTL = Number(process.env.TWILIO_NTS_TTL || 3600);
 const ROOM_ID_PATTERN = /^[a-zA-Z0-9_-]{3,120}$/;
 const authRateLimiter = new Map();
 
@@ -192,6 +194,35 @@ function isStrongEnoughPassword(password) {
 
 function isValidRoomId(roomId) {
   return ROOM_ID_PATTERN.test(roomId);
+}
+
+function createTwilioIceService() {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID || "";
+  const authToken = process.env.TWILIO_AUTH_TOKEN || "";
+  const apiKey = process.env.TWILIO_API_KEY || "";
+  const apiSecret = process.env.TWILIO_API_SECRET || "";
+  const useApiKey = Boolean(accountSid && apiKey && apiSecret);
+  const useAuthToken = Boolean(accountSid && authToken);
+  const enabled = useApiKey || useAuthToken;
+  const client = useApiKey
+    ? twilio(apiKey, apiSecret, { accountSid })
+    : useAuthToken
+      ? twilio(accountSid, authToken)
+      : null;
+
+  return {
+    isEnabled() {
+      return enabled;
+    },
+    async getIceServers() {
+      if (!enabled || !client) {
+        return [{ urls: "stun:stun.l.google.com:19302" }];
+      }
+
+      const token = await client.tokens.create({ ttl: TWILIO_NTS_TTL });
+      return token.iceServers ?? [{ urls: "stun:stun.l.google.com:19302" }];
+    },
+  };
 }
 
 function createSpacetimeClient() {
@@ -458,6 +489,7 @@ const io = new Server(server, {
 const port = process.env.PORT || 4000;
 const rooms = new Map();
 const spacetime = createSpacetimeClient();
+const twilioIce = createTwilioIceService();
 
 function getRoom(roomId) {
   if (!rooms.has(roomId)) {
@@ -630,6 +662,24 @@ app.get("/api/auth/me", requireAuth, (req, res) => {
     ok: true,
     user: sanitizeUser(user),
   });
+});
+
+app.get("/api/rtc/ice-servers", requireAuth, async (_, res) => {
+  try {
+    const iceServers = await twilioIce.getIceServers();
+    res.json({
+      ok: true,
+      iceServers,
+      provider: twilioIce.isEnabled() ? "twilio" : "fallback",
+      ttl: twilioIce.isEnabled() ? TWILIO_NTS_TTL : null,
+    });
+  } catch (error) {
+    console.error("[twilio] failed to create network traversal token", error.message);
+    res.status(502).json({
+      ok: false,
+      message: "Unable to fetch ICE servers right now.",
+    });
+  }
 });
 
 io.use((socket, next) => {
