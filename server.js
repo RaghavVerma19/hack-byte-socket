@@ -746,99 +746,6 @@ function analyzeEyeEventsHeuristically(movementEvents, phase) {
   };
 }
 
-app.post("/analyze-eye-movement", (req, res) => {
-  try {
-    const { movementEvents, eyeMovement, phase, sessionContext } = req.body || {};
-
-    const normalizedEvents =
-      Array.isArray(movementEvents) && movementEvents.length > 0
-        ? movementEvents
-        : String(eyeMovement || "")
-            .split("")
-            .filter((value) => value === "L" || value === "R")
-            .map((direction) => ({ direction, timestamp: null }));
-
-    if (!phase) {
-      res.status(400).json({ error: "Missing phase" });
-      return;
-    }
-
-    const firstTimestamp = normalizedEvents[0]?.timestamp || null;
-    const lastTimestamp = normalizedEvents[normalizedEvents.length - 1]?.timestamp || null;
-    const analyzed = analyzeEyeEventsHeuristically(normalizedEvents, phase);
-
-    res.json({
-      phase,
-      isCheating: analyzed.isCheating,
-      cheatingScore: analyzed.cheatingScore,
-      isTypewriterMovement: analyzed.isTypewriterMovement,
-      typewriterScore: analyzed.typewriterScore,
-      confidence: analyzed.confidence,
-      summary: analyzed.summary,
-      reason: analyzed.reason,
-      recommendation: analyzed.recommendation,
-      windowStart: firstTimestamp,
-      windowEnd: lastTimestamp,
-      eventCount: analyzed.eventCount,
-      pattern: analyzed.pattern,
-      sessionContext: sessionContext || null,
-    });
-  } catch (error) {
-    console.error("Error analyzing eye movement:", error);
-    const message = String(error?.message || "Unknown error");
-    res.status(500).json({ error: "Failed to analyze eye movement", details: message });
-  }
-});
-
-app.post("/analyze-session", (req, res) => {
-  try {
-    const { eyeMovements, phase, questionContext } = req.body || {};
-
-    if (!Array.isArray(eyeMovements) || !phase) {
-      res.status(400).json({ error: "Invalid request format" });
-      return;
-    }
-
-    const flattened = eyeMovements
-      .flatMap((value) => String(value || "").split(""))
-      .filter((value) => value === "L" || value === "R")
-      .map((direction) => ({ direction, timestamp: null }));
-
-    if (flattened.length === 0) {
-      res.json({
-        overallAssessment: "neutral",
-        readingProbability: 0,
-        patterns: ["No valid directional events found in session payload"],
-        confidence: "low",
-        additionalNotes: "Unable to analyze session without L/R movement data.",
-      });
-      return;
-    }
-
-    const result = analyzeEyeEventsHeuristically(flattened, phase);
-    const overallAssessment =
-      result.cheatingScore >= 70
-        ? "reading"
-        : result.cheatingScore >= 45
-          ? "distracted"
-          : "focused";
-
-    res.json({
-      overallAssessment,
-      readingProbability: result.cheatingScore,
-      patterns: [
-        `Pattern sample: ${result.pattern.slice(0, 50)}${result.pattern.length > 50 ? "..." : ""}`,
-        result.reason,
-      ],
-      confidence: result.confidence,
-      additionalNotes: questionContext || "Heuristic session-level analysis completed.",
-    });
-  } catch (error) {
-    console.error("Error analyzing session:", error);
-    res.status(500).json({ error: "Failed to analyze session", details: error.message });
-  }
-});
-
 function createRoomState(roomId) {
   return {
     roomId,
@@ -985,6 +892,99 @@ const resumeUpload = multer({
   limits: {
     fileSize: 10 * 1024 * 1024,
   },
+});
+
+app.post("/analyze-eye-movement", (req, res) => {
+  try {
+    const { movementEvents, eyeMovement, phase, sessionContext } = req.body || {};
+
+    const normalizedEvents =
+      Array.isArray(movementEvents) && movementEvents.length > 0
+        ? movementEvents
+        : String(eyeMovement || "")
+            .split("")
+            .filter((value) => value === "L" || value === "R")
+            .map((direction) => ({ direction, timestamp: null }));
+
+    if (!phase) {
+      res.status(400).json({ error: "Missing phase" });
+      return;
+    }
+
+    const firstTimestamp = normalizedEvents[0]?.timestamp || null;
+    const lastTimestamp = normalizedEvents[normalizedEvents.length - 1]?.timestamp || null;
+    const analyzed = analyzeEyeEventsHeuristically(normalizedEvents, phase);
+
+    res.json({
+      phase,
+      isCheating: analyzed.isCheating,
+      cheatingScore: analyzed.cheatingScore,
+      isTypewriterMovement: analyzed.isTypewriterMovement,
+      typewriterScore: analyzed.typewriterScore,
+      confidence: analyzed.confidence,
+      summary: analyzed.summary,
+      reason: analyzed.reason,
+      recommendation: analyzed.recommendation,
+      windowStart: firstTimestamp,
+      windowEnd: lastTimestamp,
+      eventCount: analyzed.eventCount,
+      pattern: analyzed.pattern,
+      sessionContext: sessionContext || null,
+    });
+  } catch (error) {
+    console.error("Error analyzing eye movement:", error);
+    const message = String(error?.message || "Unknown error");
+    res.status(500).json({ error: "Failed to analyze eye movement", details: message });
+  }
+});
+
+app.post("/analyze-session", (req, res) => {
+  try {
+    const { eyeMovements, phase, questionContext } = req.body || {};
+
+    if (!Array.isArray(eyeMovements) || !phase) {
+      res.status(400).json({ error: "Invalid request format" });
+      return;
+    }
+
+    const flattened = eyeMovements
+      .flatMap((value) => String(value || "").split(""))
+      .filter((value) => value === "L" || value === "R")
+      .map((direction) => ({ direction, timestamp: null }));
+
+    if (flattened.length === 0) {
+      res.json({
+        overallAssessment: "neutral",
+        readingProbability: 0,
+        patterns: ["No valid directional events found in session payload"],
+        confidence: "low",
+        additionalNotes: "Unable to analyze session without L/R movement data.",
+      });
+      return;
+    }
+
+    const result = analyzeEyeEventsHeuristically(flattened, phase);
+    const overallAssessment =
+      result.cheatingScore >= 70
+        ? "reading"
+        : result.cheatingScore >= 45
+          ? "distracted"
+          : "focused";
+
+    res.json({
+      overallAssessment,
+      readingProbability: result.cheatingScore,
+      patterns: [
+        `Pattern sample: ${result.pattern.slice(0, 50)}${result.pattern.length > 50 ? "..." : ""}`,
+        result.reason,
+      ],
+      confidence: result.confidence,
+      additionalNotes: questionContext || "Heuristic session-level analysis completed.",
+    });
+  } catch (error) {
+    console.error("Error analyzing session:", error);
+    res.status(500).json({ error: "Failed to analyze session", details: error.message });
+  }
 });
 
 const server = http.createServer(app);
