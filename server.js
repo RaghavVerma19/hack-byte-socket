@@ -159,6 +159,33 @@ function compactWhitespace(input) {
   return String(input || "").replace(/\s+/g, " ").trim();
 }
 
+function parseGeminiJsonPayload(rawText) {
+  const text = String(rawText || "").trim();
+  if (!text) {
+    return {};
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {}
+
+  const fencedMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fencedMatch?.[1]) {
+    try {
+      return JSON.parse(fencedMatch[1]);
+    } catch {}
+  }
+
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (jsonMatch?.[0]) {
+    try {
+      return JSON.parse(jsonMatch[0]);
+    } catch {}
+  }
+
+  throw new Error("Gemini returned a non-JSON scoring payload.");
+}
+
 function pushTranscriptHistory(state, text) {
   const normalizedTranscript = compactWhitespace(text);
   if (!normalizedTranscript) {
@@ -600,8 +627,13 @@ function createAiReviewService() {
       }
 
       const payload = await response.json();
-      const text = payload?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-      const parsed = JSON.parse(text);
+      const parts = payload?.candidates?.[0]?.content?.parts;
+      const text = Array.isArray(parts)
+        ? parts
+            .map((part) => (typeof part?.text === "string" ? part.text : ""))
+            .join("\n")
+        : "{}";
+      const parsed = parseGeminiJsonPayload(text);
 
       return {
         aiLikelihood: clamp(Number(parsed?.aiLikelihood) || 0, 0, 100),
@@ -1117,7 +1149,7 @@ function runAiAnalysis(roomId) {
     });
 }
 
-function queueTranscriptForAnalysis(roomId, transcript) {
+function queueTranscriptForAnalysis(roomId, transcript, options = {}) {
   const normalizedTranscript = compactWhitespace(transcript);
   if (!normalizedTranscript) {
     return;
@@ -1125,14 +1157,19 @@ function queueTranscriptForAnalysis(roomId, transcript) {
 
   const state = getOrCreateAiState(roomId);
   state.liveDraft = "";
-  const addedToHistory = pushTranscriptHistory(state, normalizedTranscript);
+  const skipHistoryPush = Boolean(options.skipHistoryPush);
+  const addedToHistory = skipHistoryPush
+    ? true
+    : pushTranscriptHistory(state, normalizedTranscript);
   if (!addedToHistory) {
     state.status = "listening";
     state.detail = "Repeated transcript ignored. Waiting for the next spoken phrase.";
     emitAiScoreUpdate(roomId);
     return;
   }
-  emitAiTranscriptUpdate(roomId);
+  if (!skipHistoryPush) {
+    emitAiTranscriptUpdate(roomId);
+  }
 
   if (countWords(normalizedTranscript) < AI_TRANSCRIPT_MIN_WORDS) {
     state.status = "listening";
@@ -1165,7 +1202,7 @@ function flushPendingParagraph(roomId) {
     return;
   }
 
-  queueTranscriptForAnalysis(roomId, paragraph);
+  queueTranscriptForAnalysis(roomId, paragraph, { skipHistoryPush: true });
 }
 
 function appendTranscriptForScoring(roomId, transcript) {
