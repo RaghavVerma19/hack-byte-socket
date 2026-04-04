@@ -24,11 +24,11 @@ const TWILIO_NTS_TTL = Number(process.env.TWILIO_NTS_TTL || 3600);
 const ROOM_ID_PATTERN = /^[a-zA-Z0-9_-]{3,120}$/;
 const DEEPGRAM_MODEL = process.env.DEEPGRAM_MODEL || "nova-2";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash-lite";
-const AI_TRANSCRIPT_MIN_WORDS = Number(process.env.AI_TRANSCRIPT_MIN_WORDS || 6);
-const AI_ANALYSIS_MIN_WORDS = Number(process.env.AI_ANALYSIS_MIN_WORDS || 14);
+const AI_TRANSCRIPT_MIN_WORDS = Number(process.env.AI_TRANSCRIPT_MIN_WORDS || 1);
+const AI_ANALYSIS_MIN_WORDS = Number(process.env.AI_ANALYSIS_MIN_WORDS || 6);
 const AI_MAX_SEGMENTS = Number(process.env.AI_MAX_SEGMENTS || 6);
 const AI_MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 8);
-const AI_ANALYSIS_DEBOUNCE_MS = Number(process.env.AI_ANALYSIS_DEBOUNCE_MS || 7000);
+const AI_ANALYSIS_DEBOUNCE_MS = Number(process.env.AI_ANALYSIS_DEBOUNCE_MS || 2000);
 const authRateLimiter = new Map();
 const aiInterviewState = new Map();
 
@@ -445,6 +445,11 @@ function createAiReviewService() {
         return "";
       }
 
+      const normalizedMimeType =
+        typeof mimeType === "string" && mimeType.includes("ogg")
+          ? "audio/ogg"
+          : "audio/webm";
+
       const response = await fetch(
         `https://api.deepgram.com/v1/listen?model=${encodeURIComponent(
           DEEPGRAM_MODEL,
@@ -453,7 +458,7 @@ function createAiReviewService() {
           method: "POST",
           headers: {
             Authorization: `Token ${deepgramApiKey}`,
-            "Content-Type": mimeType || "audio/webm",
+            "Content-Type": normalizedMimeType,
           },
           body: audioBuffer,
         },
@@ -738,15 +743,19 @@ function runAiAnalysis(roomId) {
   const state = getOrCreateAiState(roomId);
   state.analysisPromise = state.analysisPromise
     .then(async () => {
-      const transcriptWindow = state.transcriptSegments.slice(-3).join(" ").trim();
+      const transcriptWindow = state.transcriptSegments.slice(-AI_MAX_SEGMENTS).join(" ").trim();
       if (countWords(transcriptWindow) < AI_ANALYSIS_MIN_WORDS) {
         state.status = "listening";
-        state.detail = "Waiting for a longer spoken answer.";
+        state.detail = "Waiting for a few more spoken words before scoring.";
         emitAiScoreUpdate(roomId);
         return;
       }
 
-      const priorContext = state.transcriptSegments.slice(-5, -3).join(" ").trim();
+      const priorContext = state.transcriptHistory
+        .slice(-(AI_MAX_HISTORY + AI_MAX_SEGMENTS), -AI_MAX_SEGMENTS)
+        .map((entry) => entry.text)
+        .join(" ")
+        .trim();
       try {
         const result = await aiReview.scoreTranscript(transcriptWindow, priorContext);
         state.scoreHistory.push({
@@ -804,7 +813,7 @@ function queueTranscriptForAnalysis(roomId, transcript) {
 
   state.transcriptSegments.push(normalizedTranscript);
   state.status = "listening";
-  state.detail = "Captured candidate speech. Preparing the next analysis window.";
+  state.detail = "Captured candidate speech. Updating live analysis.";
   if (state.transcriptSegments.length > AI_MAX_SEGMENTS) {
     state.transcriptSegments.shift();
   }
