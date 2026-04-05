@@ -1128,7 +1128,7 @@ function scheduleAiAnalysis(roomId) {
   state.detail = "Paragraph complete. Sending to Gemini for scoring.";
   emitAiScoreUpdate(roomId);
 
-  // No debounce — call Gemini immediately when a full paragraph is ready.
+  console.log(`[ai-review] paragraph ready for room ${roomId}, calling Gemini now`);
   runAiAnalysis(roomId);
 }
 
@@ -1150,7 +1150,9 @@ function runAiAnalysis(roomId) {
         .join(" ")
         .trim();
       try {
+        console.log(`[ai-review] scoring ${countWords(transcriptWindow)} words for room ${roomId}`);
         const result = await aiReview.scoreTranscript(transcriptWindow, priorContext);
+        console.log(`[ai-review] Gemini returned aiLikelihood=${result.aiLikelihood} confidence=${result.confidence}`);
         state.scoreHistory.push({
           aiLikelihood: result.aiLikelihood,
           confidence: result.confidence,
@@ -1159,6 +1161,9 @@ function runAiAnalysis(roomId) {
         if (state.scoreHistory.length > AI_MAX_HISTORY) {
           state.scoreHistory.shift();
         }
+
+        // Clear segments after scoring so next paragraph gets fresh analysis
+        state.transcriptSegments = [];
 
         const average =
           state.scoreHistory.reduce((sum, item) => sum + item.aiLikelihood, 0) /
@@ -1229,6 +1234,7 @@ function flushPendingParagraph(roomId) {
     return;
   }
 
+  console.log(`[ai-review] flushing paragraph (${countWords(paragraph)} words) for room ${roomId}`);
   queueTranscriptForAnalysis(roomId, paragraph, { skipHistoryPush: true });
 }
 
@@ -1244,6 +1250,7 @@ function appendTranscriptForScoring(roomId, transcript) {
   // Only flush when the paragraph has enough words — no timers.
   const paragraphWordCount = countWords(state.pendingParagraph);
   if (paragraphWordCount >= AI_PARAGRAPH_MIN_WORDS) {
+    console.log(`[ai-review] buffer hit ${paragraphWordCount} words, flushing for room ${roomId}`);
     flushPendingParagraph(roomId);
   }
 }
