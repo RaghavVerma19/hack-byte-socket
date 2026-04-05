@@ -1077,7 +1077,7 @@ const io = new Server(server, {
   },
 });
 
-const port = process.env.PORT || 4000;
+const port = process.env.PORT || 3000;
 const rooms = new Map();
 const spacetime = createSpacetimeClient();
 const twilioIce = createTwilioIceService();
