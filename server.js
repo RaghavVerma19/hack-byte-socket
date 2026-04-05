@@ -32,9 +32,9 @@ const AI_MAX_SEGMENTS = Number(process.env.AI_MAX_SEGMENTS || 6);
 const AI_MAX_HISTORY = Number(process.env.AI_MAX_HISTORY || 8);
 const AI_DISPLAY_TRANSCRIPT_HISTORY = Number(process.env.AI_DISPLAY_TRANSCRIPT_HISTORY || 80);
 const AI_ANALYSIS_DEBOUNCE_MS = Number(process.env.AI_ANALYSIS_DEBOUNCE_MS || 35000);
-const AI_PARAGRAPH_MIN_WORDS = Number(process.env.AI_PARAGRAPH_MIN_WORDS || 16);
+const AI_PARAGRAPH_MIN_WORDS = Number(process.env.AI_PARAGRAPH_MIN_WORDS || 60);
 const AI_PARAGRAPH_SOFT_MIN_WORDS = Number(process.env.AI_PARAGRAPH_SOFT_MIN_WORDS || 8);
-const AI_PARAGRAPH_FLUSH_MS = Number(process.env.AI_PARAGRAPH_FLUSH_MS || 30000);
+const AI_PARAGRAPH_FLUSH_MS = Number(process.env.AI_PARAGRAPH_FLUSH_MS || 5000);
 const authRateLimiter = new Map();
 const aiInterviewState = new Map();
 const eyeAnalysisState = new Map();
@@ -1125,19 +1125,11 @@ function emitEyeAnalysisUpdate(roomId) {
 function scheduleAiAnalysis(roomId) {
   const state = getOrCreateAiState(roomId);
   state.status = "analyzing";
-  state.detail = "Analyzing recent candidate response.";
+  state.detail = "Paragraph complete. Sending to Gemini for scoring.";
   emitAiScoreUpdate(roomId);
 
-  // Don't reset if a timer is already ticking — let it fire on schedule.
-  // New transcript segments just accumulate more data for when it does fire.
-  if (state.analysisTimer) {
-    return;
-  }
-
-  state.analysisTimer = setTimeout(() => {
-    state.analysisTimer = null;
-    runAiAnalysis(roomId);
-  }, AI_ANALYSIS_DEBOUNCE_MS);
+  // No debounce — call Gemini immediately when a full paragraph is ready.
+  runAiAnalysis(roomId);
 }
 
 function runAiAnalysis(roomId) {
@@ -1231,11 +1223,6 @@ function queueTranscriptForAnalysis(roomId, transcript, options = {}) {
 
 function flushPendingParagraph(roomId) {
   const state = getOrCreateAiState(roomId);
-  if (state.paragraphTimer) {
-    clearTimeout(state.paragraphTimer);
-    state.paragraphTimer = null;
-  }
-
   const paragraph = compactWhitespace(state.pendingParagraph);
   state.pendingParagraph = "";
   if (!paragraph) {
@@ -1254,22 +1241,10 @@ function appendTranscriptForScoring(roomId, transcript) {
     `${state.pendingParagraph ? `${state.pendingParagraph} ` : ""}${normalizedTranscript}`,
   );
 
+  // Only flush when the paragraph has enough words — no timers.
   const paragraphWordCount = countWords(state.pendingParagraph);
-  const endsSentence = /[.!?]$/.test(state.pendingParagraph);
-  if (
-    paragraphWordCount >= AI_PARAGRAPH_MIN_WORDS ||
-    (endsSentence && paragraphWordCount >= AI_PARAGRAPH_SOFT_MIN_WORDS)
-  ) {
+  if (paragraphWordCount >= AI_PARAGRAPH_MIN_WORDS) {
     flushPendingParagraph(roomId);
-    return;
-  }
-
-  // Don't reset if a timer is already ticking — let the first fragment
-  // start the clock, subsequent ones just add words to the paragraph.
-  if (!state.paragraphTimer) {
-    state.paragraphTimer = setTimeout(() => {
-      flushPendingParagraph(roomId);
-    }, AI_PARAGRAPH_FLUSH_MS);
   }
 }
 
