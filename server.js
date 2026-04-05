@@ -12,6 +12,16 @@ const twilio = require("twilio");
 const { execFile } = require("child_process");
 const { Server } = require("socket.io");
 const { analyzeResumePipeline } = require("./services/resume/resumeAnalyzer");
+const { extractResumeData } = require("./services/resume/resumeExtractor");
+const { analyzeAtsScore } = require("./services/resume/atsAnalyzer");
+const { verifyGithubProjects, verifyGithubProfile, extractGithubUsername } = require("./services/resume/githubverifyservice");
+const { analyzeCommitsAndContributors } = require("./services/resume/githubCommitVerifier");
+const { analyzeSkillDecay } = require("./services/resume/githubSkillDecay");
+const { verifyCodingProfiles } = require("./services/resume/codingProfilesVerify");
+const { verifyLeetCode } = require("./services/resume/leetcodeVerify");
+const { verifyCodeforces } = require("./services/resume/codeforcesVerify");
+const { verifyCodechef } = require("./services/resume/codechefVerify");
+const { generateFinalReview } = require("./services/resume/reviewGenerator");
 
 const USERS_FILE = path.join(__dirname, "data", "users.json");
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
@@ -325,6 +335,8 @@ function getAiSnapshot(roomId) {
     status: state.status,
     detail: state.detail,
     transcriptMode: state.transcriptMode,
+    bufferWordCount: countWords(state.pendingParagraph),
+    bufferThreshold: AI_PARAGRAPH_MIN_WORDS,
   };
 }
 
@@ -1249,6 +1261,10 @@ function appendTranscriptForScoring(roomId, transcript) {
 
   // Only flush when the paragraph has enough words — no timers.
   const paragraphWordCount = countWords(state.pendingParagraph);
+  state.status = "listening";
+  state.detail = `Buffer: ${paragraphWordCount}/${AI_PARAGRAPH_MIN_WORDS} words`;
+  emitAiScoreUpdate(roomId);
+
   if (paragraphWordCount >= AI_PARAGRAPH_MIN_WORDS) {
     console.log(`[ai-review] buffer hit ${paragraphWordCount} words, flushing for room ${roomId}`);
     flushPendingParagraph(roomId);
@@ -1517,6 +1533,138 @@ app.post("/api/analyze-resume", requireAuth, resumeUpload.single("resume"), asyn
       message: "Failed to analyze resume pipeline.",
       error: error.message,
     });
+  }
+});
+
+// ============================================
+// PROGRESSIVE RESUME / VERIFIER API ENDPOINTS
+// ============================================
+
+app.post("/api/analyze-resume/extract", requireAuth, resumeUpload.single("resume"), async (req, res) => {
+  if (req.user.role !== "interviewer") {
+    return res.status(403).json({ success: false, message: "Only interviewers can extract resumes." });
+  }
+  if (!req.file || req.file.mimetype !== "application/pdf") {
+    return res.status(400).json({ success: false, message: "A valid PDF file is required." });
+  }
+
+  try {
+    const { extractedData, rawText } = await extractResumeData(req.file.buffer, []);
+    extractedData._pdfHyperlinks = Array.from(new Set((String(rawText || "").match(/https?:\/\/[^\s)>\]]+/gi) || []).map(l => l.replace(/[),.;]+$/, ""))));
+    res.json({ success: true, data: { extractedData, rawText } });
+  } catch (error) {
+    console.error("[extractResume] failed", error);
+    res.status(error.statusCode || 500).json({ success: false, message: "Extraction failed.", error: error.message });
+  }
+});
+
+app.post("/api/verify/ats-score", requireAuth, async (req, res) => {
+  try {
+    const { resumeText } = req.body;
+    if (!resumeText) return res.status(400).json({ error: "resumeText is required" });
+    const result = await analyzeAtsScore(resumeText);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: "Internal server error analyzing ATS" });
+  }
+});
+
+app.post("/api/verify/github", requireAuth, async (req, res) => {
+  const { username, profileUrl } = req.body ?? {};
+  if (!username && !profileUrl) return res.status(400).json({ success: false, message: "username or profileUrl required" });
+  
+  const normalized = extractGithubUsername(username || profileUrl);
+  if (!normalized) return res.status(400).json({ success: false, message: "Invalid GitHub username/url" });
+
+  try {
+    const result = await verifyGithubProfile(normalized);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+});
+
+app.post("/api/verify/projects", requireAuth, async (req, res) => {
+  try {
+    const result = await verifyGithubProjects(req.body ?? {});
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+});
+
+app.post("/api/verify/github-commits", requireAuth, async (req, res) => {
+  try {
+    const { owner, repoName } = req.body;
+    if (!owner || !repoName) return res.status(400).json({ error: "owner and repoName required" });
+    const result = await analyzeCommitsAndContributors(owner, repoName);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: "Internal server error analyzing commits" });
+  }
+});
+
+app.post("/api/verify/github-skill-decay", requireAuth, async (req, res) => {
+  try {
+    const { username, claimedSkills } = req.body;
+    if (!username || !claimedSkills) return res.status(400).json({ error: "username and claimedSkills required" });
+    const result = await analyzeSkillDecay(username, claimedSkills);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: "Internal server error analyzing skill decay" });
+  }
+});
+
+app.post("/api/verify/coding-profiles", requireAuth, async (req, res) => {
+  try {
+    const { codingProfiles } = req.body ?? {};
+    if (!codingProfiles || typeof codingProfiles !== "object") {
+      return res.status(400).json({ success: false, message: "Invalid codingProfiles object" });
+    }
+    const result = await verifyCodingProfiles(codingProfiles);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/api/verify/leetcode", requireAuth, async (req, res) => {
+  try {
+    if (!req.body?.username) return res.status(400).json({ success: false, message: "username required" });
+    const result = await verifyLeetCode(req.body);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/api/verify/codeforces", requireAuth, async (req, res) => {
+  try {
+    if (!req.body?.username) return res.status(400).json({ success: false, message: "username required" });
+    const result = await verifyCodeforces(req.body);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/api/verify/codechef", requireAuth, async (req, res) => {
+  try {
+    if (!req.body?.username) return res.status(400).json({ success: false, message: "username required" });
+    const result = await verifyCodechef(req.body);
+    res.json({ success: true, data: result });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/api/generate-review", requireAuth, async (req, res) => {
+  try {
+    if (!req.body?.verificationData) return res.status(400).json({ error: "verificationData required" });
+    const result = await generateFinalReview(req.body.verificationData);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: "Internal server error computing final review" });
   }
 });
 
@@ -1829,7 +1977,9 @@ io.on("connection", (socket) => {
 
         const transcript = await aiReview.transcribeChunk(audioBuffer, mimeType);
         if (transcript) {
-          queueTranscriptForAnalysis(roomId, transcript);
+          pushTranscriptHistory(aiState, transcript);
+          appendTranscriptForScoring(roomId, transcript);
+          emitAiTranscriptUpdate(roomId);
         } else {
           aiState.status = "listening";
           aiState.detail = "Audio received, but no clear speech was transcribed.";
