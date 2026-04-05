@@ -1127,8 +1127,11 @@ function scheduleAiAnalysis(roomId) {
   state.status = "analyzing";
   state.detail = "Analyzing recent candidate response.";
   emitAiScoreUpdate(roomId);
+
+  // Don't reset if a timer is already ticking — let it fire on schedule.
+  // New transcript segments just accumulate more data for when it does fire.
   if (state.analysisTimer) {
-    clearTimeout(state.analysisTimer);
+    return;
   }
 
   state.analysisTimer = setTimeout(() => {
@@ -1251,10 +1254,6 @@ function appendTranscriptForScoring(roomId, transcript) {
     `${state.pendingParagraph ? `${state.pendingParagraph} ` : ""}${normalizedTranscript}`,
   );
 
-  if (state.paragraphTimer) {
-    clearTimeout(state.paragraphTimer);
-  }
-
   const paragraphWordCount = countWords(state.pendingParagraph);
   const endsSentence = /[.!?]$/.test(state.pendingParagraph);
   if (
@@ -1265,9 +1264,13 @@ function appendTranscriptForScoring(roomId, transcript) {
     return;
   }
 
-  state.paragraphTimer = setTimeout(() => {
-    flushPendingParagraph(roomId);
-  }, AI_PARAGRAPH_FLUSH_MS);
+  // Don't reset if a timer is already ticking — let the first fragment
+  // start the clock, subsequent ones just add words to the paragraph.
+  if (!state.paragraphTimer) {
+    state.paragraphTimer = setTimeout(() => {
+      flushPendingParagraph(roomId);
+    }, AI_PARAGRAPH_FLUSH_MS);
+  }
 }
 
 function updateLiveTranscript(roomId, text, isFinal) {
