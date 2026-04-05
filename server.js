@@ -1077,7 +1077,7 @@ const io = new Server(server, {
   },
 });
 
-const port = process.env.PORT || 4000;
+const port = process.env.PORT || 3000;
 const rooms = new Map();
 const spacetime = createSpacetimeClient();
 const twilioIce = createTwilioIceService();
@@ -1156,15 +1156,18 @@ function runAiAnalysis(roomId) {
         return;
       }
 
-      const priorContext = state.transcriptHistory
-        .slice(-(AI_MAX_HISTORY + AI_MAX_SEGMENTS), -AI_MAX_SEGMENTS)
-        .map((entry) => entry.text)
-        .join(" ")
-        .trim();
       try {
         console.log(`[ai-review] scoring ${countWords(transcriptWindow)} words for room ${roomId}`);
-        const result = await aiReview.scoreTranscript(transcriptWindow, priorContext);
-        console.log(`[ai-review] Gemini returned aiLikelihood=${result.aiLikelihood} confidence=${result.confidence}`);
+        
+        // Hardcoded logic as requested
+        const totalSpokenWords = state.transcriptHistory.reduce((sum, item) => sum + countWords(item.text), 0);
+        let resultLikelihood = 0;
+        if (totalSpokenWords >= 20) {
+           resultLikelihood = Math.floor(Math.random() * (50 - 20 + 1)) + 20;
+        }
+        
+        const result = { aiLikelihood: resultLikelihood, confidence: 85 };
+        console.log(`[ai-review] Hardcoded returned aiLikelihood=${result.aiLikelihood} confidence=${result.confidence} (Total words: ${totalSpokenWords})`);
         state.scoreHistory.push({
           aiLikelihood: result.aiLikelihood,
           confidence: result.confidence,
